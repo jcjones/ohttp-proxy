@@ -1,0 +1,18 @@
+[package]
+name = "ohttp-socks5-proxy"
+description = "SOCKS5 Proxy for Oblivious HTTP (RFC 9458) using Binary HTTP messages (RFC 9292)"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+
+[dependencies]
+bhttp = { version = "0.6.1", features = ["read-http", "write-http"] }
+clap = { version = "4.5.45", features = ["derive"] }
+clap-verbosity-flag = { version = "3.0.4", default-features = false, features = ["tracing"] }
+ohttp = "0.6.1"
+reqwest = { version = "0.12.23", features = ["rustls-tls"] }
+socks-lib = "0.1.5"
+thiserror = "2.0.15"
+tokio = { version = "1.47.1", features = ["net", "rt-multi-thread", "signal"] }
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
