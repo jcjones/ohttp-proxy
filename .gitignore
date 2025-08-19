@@ -1,1 +1,5 @@
-/target
+.certs/
+.mkcert/
+.privacy-gateway-server-go/
+target/
+

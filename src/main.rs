@@ -1,10 +1,11 @@
 use bhttp::{Message, Mode};
+use bytes::BytesMut;
 use clap::Parser;
 use clap_verbosity_flag::{InfoLevel, Verbosity};
 use ohttp::ClientRequest;
 use reqwest::{
     Client, ClientBuilder,
-    header::{CONTENT_TYPE, HeaderMap, HeaderValue, InvalidHeaderValue, ToStrError},
+    header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, InvalidHeaderValue, ToStrError},
 };
 use socks_lib::{
     io::{self, AsyncRead, AsyncWrite},
@@ -14,9 +15,9 @@ use socks_lib::{
         server::{Config, Handler, Server, auth::NoAuthentication},
     },
 };
-use std::{io::Cursor, net::SocketAddr, string::FromUtf8Error};
+use std::{io::Cursor, net::SocketAddr, string::FromUtf8Error, sync::Mutex};
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, info, instrument, trace, warn};
 use tracing_subscriber::FmtSubscriber;
 
@@ -25,12 +26,37 @@ use tracing_subscriber::FmtSubscriber;
 struct Args {
     #[command(flatten)]
     verbosity: Verbosity<InfoLevel>,
+
+    /// The socket address on which to listen.
+    ///
+    /// 0.0.0.0 or [::] are v4 and v6 wildcard addresses.
+    /// For IPv4 localhost only, use 127.0.0.1:<port>
     #[arg(long, default_value = "[::]:32547")]
     listen: SocketAddr,
+
+    /// URL to the OHTTP Relay's gateway, often ending in `/gateway`
+    ///
+    /// Note that any relay headers supplied will be sent with each request.
     #[arg(long)]
-    ohttp_url: String,
+    ohttp_relay_url: String,
+
+    /// URL to the OHTTP Configuration, often ending in `/ohttp-configs`
+    ///
+    /// Note that any relay headers supplied will be sent with the request.
     #[arg(long)]
-    ca_cert: String,
+    ohttp_configuration_url: String,
+
+    /// A custom CA certificate to use.
+    #[arg(long)]
+    ca_cert: Option<String>,
+
+    /// If specified as X=Y, send that HTTP header to the relay.
+    ///
+    /// Example: X-Relay-Auth=authcookiegibberish
+    ///
+    /// May be specified multiple times, to send more than one header.
+    #[arg(long)]
+    relay_headers: Option<Vec<String>>,
 }
 
 #[derive(Error, Debug)]
@@ -41,70 +67,116 @@ pub enum OhttpProxyError {
     BhttpError(#[from] bhttp::Error),
     #[error("Error in HTTP transport")]
     ReqwestError(#[from] reqwest::Error),
-    #[error("Bad PAT Header")]
-    HeaderError(#[from] InvalidHeaderValue),
+    #[error("Invalid header value")]
+    HeaderValueError(#[from] InvalidHeaderValue),
+    #[error("Invalid header name")]
+    HeaderNameError(#[from] reqwest::header::InvalidHeaderName),
     #[error("Invalid String Encoding")]
     StringEncodingError(#[from] ToStrError),
     #[error("Invalid UTF-8 Encoding")]
     UTF8EncodingError(#[from] FromUtf8Error),
     #[error("OHTTP is unconfigured")]
     Unconfigured,
-    #[error("Invalid Content Type: {0}")]
-    ContentError(String),
+    #[error("Invalid Content Type: {0} != {1}")]
+    ContentTypeMismatchError(String, String),
+    #[error("Unexpectedly large HTTP data: {0}")]
+    HttpTooLarge(u64),
+    #[error("HTTP response data is empty")]
+    ResponseEmpty,
     #[error("IO Error")]
     IOError(#[from] std::io::Error),
+    #[error("Mutex poisoned")]
+    MutexPoisoned,
 }
 
 const OHTTP_REQ_TYPE: &str = "message/ohttp-req";
 const OHTTP_RESP_TYPE: &str = "message/ohttp-res";
 const OHTTP_CONFIG_TYPE: &str = "application/octet-stream";
+const MAX_OHTTP_CONFIG_SIZE: u64 = 64 * 1024; // 64 kB
+const MAX_OHTTP_RESPONSE_SIZE: u64 = 1024 * 1024; // 1MB
+const SOCKS5_REQ_BUF_SIZE: usize = 64 * 1024; // 64kB
 
 pub struct OHTTPSocksProxy {
     ohttp_relay_client: Client,
-    base_url: String,
-    ohttp_config: Option<Vec<u8>>,
+    gateway_url: String,
+    ohttp_config: Mutex<Option<Vec<u8>>>,
 }
 
 impl OHTTPSocksProxy {
-    fn try_new(base_url: String, pat: String) -> Result<Self, OhttpProxyError> {
+    fn try_new(
+        gateway_url: String,
+        relay_headers: Option<Vec<String>>,
+        ca_cert_path: Option<String>,
+    ) -> Result<Self, OhttpProxyError> {
         let mut headers = HeaderMap::new();
-        let mut auth_value = HeaderValue::from_str(&pat)?;
-        auth_value.set_sensitive(true);
-        headers.insert("PAT", auth_value);
+
+        // If there are headers that should be added to the requests sent to the
+        // relay, then add them in as defaults.
+        if let Some(header_strings) = relay_headers {
+            for header_str in header_strings {
+                if let Some((name, value)) = header_str.split_once("=") {
+                    let mut auth_value = HeaderValue::from_str(value)?;
+                    auth_value.set_sensitive(true);
+                    debug!(name, "Set relay header.");
+                    headers.insert(HeaderName::from_bytes(name.as_bytes())?, auth_value);
+                }
+            }
+        }
+
+        let mut client_builder = ClientBuilder::new().default_headers(headers);
+
+        if let Some(cert_path) = ca_cert_path {
+            let cert_bytes = std::fs::read(&cert_path)?;
+            let cert = reqwest::Certificate::from_pem(&cert_bytes)?;
+            client_builder = client_builder.add_root_certificate(cert);
+            info!(cert_path, "Loaded CA certificate.")
+        }
 
         Ok(Self {
-            base_url,
-            ohttp_relay_client: ClientBuilder::new().default_headers(headers).build()?,
-            ohttp_config: None,
+            gateway_url,
+            ohttp_relay_client: client_builder.build()?,
+            ohttp_config: Mutex::new(None),
         })
     }
 
     #[instrument(skip(self))]
-    async fn get_configuration(&mut self) -> Result<(), OhttpProxyError> {
-        let url = format!("{}/ohttp-configs", self.base_url);
+    async fn get_configuration(&mut self, config_url: String) -> Result<(), OhttpProxyError> {
         let resp = self
             .ohttp_relay_client
-            .get(&url)
+            .get(&config_url)
             .send()
             .await?
             .error_for_status()?;
         if let Some(value) = resp.headers().get(CONTENT_TYPE) {
             if value != OHTTP_CONFIG_TYPE {
                 let s = value.to_str()?;
-                return Err(OhttpProxyError::ContentError(s.to_string()));
+                return Err(OhttpProxyError::ContentTypeMismatchError(
+                    OHTTP_CONFIG_TYPE.to_string(),
+                    s.to_string(),
+                ));
+            }
+        }
+        if let Some(size) = resp.content_length() {
+            if size > MAX_OHTTP_CONFIG_SIZE {
+                return Err(OhttpProxyError::HttpTooLarge(size));
             }
         }
         let ohttp_vec = resp.bytes().await?.to_vec();
-        info!(url, ohttp_config_len=?ohttp_vec.len(), "Obtained OHTTP configuration from relay.");
-        self.ohttp_config = Some(ohttp_vec);
+        info!(config_url, ohttp_config_len=?ohttp_vec.len(), "Obtained OHTTP configuration from relay.");
+
+        *self
+            .ohttp_config
+            .lock()
+            .map_err(|_| OhttpProxyError::MutexPoisoned)? = Some(ohttp_vec);
         Ok(())
     }
 
     fn get_ohttp_client(&self) -> Result<ClientRequest, OhttpProxyError> {
         Ok(ClientRequest::from_encoded_config(
-            &self
-                .ohttp_config
-                .clone()
+            self.ohttp_config
+                .lock()
+                .map_err(|_| OhttpProxyError::MutexPoisoned)?
+                .as_ref()
                 .ok_or(OhttpProxyError::Unconfigured)?,
         )?)
     }
@@ -113,7 +185,7 @@ impl OHTTPSocksProxy {
     async fn ohttp_tx(&self, req_body: Vec<u8>) -> Result<Vec<u8>, OhttpProxyError> {
         let resp = self
             .ohttp_relay_client
-            .post(format!("{}/gateway", self.base_url))
+            .post(&self.gateway_url)
             .header(CONTENT_TYPE, OHTTP_REQ_TYPE)
             .body(req_body)
             .send()
@@ -122,10 +194,27 @@ impl OHTTPSocksProxy {
         if let Some(value) = resp.headers().get(CONTENT_TYPE) {
             if value != OHTTP_RESP_TYPE {
                 let s = value.to_str()?;
-                return Err(OhttpProxyError::ContentError(s.to_string()));
+                return Err(OhttpProxyError::ContentTypeMismatchError(
+                    OHTTP_RESP_TYPE.to_string(),
+                    s.to_string(),
+                ));
+            }
+        } else {
+            return Err(OhttpProxyError::ContentTypeMismatchError(
+                OHTTP_RESP_TYPE.to_string(),
+                "<empty>".to_string(),
+            ));
+        }
+        if let Some(size) = resp.content_length() {
+            if size > MAX_OHTTP_RESPONSE_SIZE {
+                return Err(OhttpProxyError::HttpTooLarge(size));
             }
         }
-        trace!(?resp, "OHTTP gateway response");
+        trace!(
+            status = resp.status().as_u16(),
+            content_length = resp.content_length(),
+            "OHTTP Relay response."
+        );
         Ok(resp.bytes().await?.to_vec())
     }
 
@@ -137,33 +226,69 @@ impl OHTTPSocksProxy {
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + Sync,
     {
-        let mut buffered_stream = BufStream::with_capacity(8 * 1024, 8 * 1024, stream);
-        let mut read_cursor = Cursor::new(buffered_stream.fill_buf().await?);
-        let req_msg = Message::read_http(&mut read_cursor)?;
-        trace!(?req_msg, "HTTP message read");
-        let mut req_vec = Vec::new();
-        req_msg
-            .write_bhttp(Mode::KnownLength, &mut req_vec)
-            .unwrap();
-        let (enc_request_vec, ohttp_tx_decoder) = self.get_ohttp_client()?.encapsulate(&req_vec)?;
+        // Read the HTTP request from the SOCKS5 client
+        let mut req_buf = BytesMut::with_capacity(SOCKS5_REQ_BUF_SIZE);
+        stream.read_buf(&mut req_buf).await?;
+        let req_msg = Message::read_http(&mut Cursor::new(req_buf))?;
+        info!(
+            method = req_msg
+                .control()
+                .method()
+                .map(String::from_utf8_lossy)
+                .as_deref()
+                .unwrap_or("UNKNOWN"),
+            path = req_msg
+                .control()
+                .path()
+                .map(String::from_utf8_lossy)
+                .as_deref()
+                .unwrap_or("UNKNOWN"),
+            // Authority only comes from HTTP2, and SOCKS5 doesn't support that. So
+            // we're printing what we have that is reasonably anonymous.
+            "HTTP request read from SOCKS5 client, forwarding using OHTTP."
+        );
 
-        trace!(encap_req=?enc_request_vec, "Encoded encapsulated OHTTP request");
+        // Convert the request to Binary HTTP format
+        let mut req_bhttp_vec = Vec::new();
+        req_msg.write_bhttp(Mode::KnownLength, &mut req_bhttp_vec)?;
+
+        // Encapsulate with OHTTP
+        let (enc_request_vec, ohttp_tx_decoder) =
+            self.get_ohttp_client()?.encapsulate(&req_bhttp_vec)?;
+        trace!(
+            encap_req = hex::encode(&enc_request_vec),
+            "Encoded OHTTP request, encapsulated to Gateway, sending via Relay."
+        );
+
+        // Send OHTTP request, get back OHTTP response
         let ohttp_response_vec = self.ohttp_tx(enc_request_vec).await?;
         debug!(
             encap_rsp_len = ohttp_response_vec.len(),
-            "Received encapsulated OHTTP response"
+            "Received encapsulated OHTTP response from Gateway, via Relay."
         );
+
+        // Decapsulate from OHTTP
         let resp_vec = ohttp_tx_decoder.decapsulate(&ohttp_response_vec)?;
-        trace!(rsp_len = resp_vec.len(), "Decapsulated OHTTP response");
+        trace!(
+            rsp_len = resp_vec.len(),
+            "Decapsulated OHTTP response from Gateway."
+        );
+
+        // Convert the Binary HTTP format back to text
         let response = Message::read_bhttp(&mut Cursor::new(&resp_vec[..]))?;
-        trace!(?response, "Decoded BHTTP response");
+        trace!(
+            content_length = response.content().len(),
+            "Decoded BHTTP response from Gateway."
+        );
+
+        // Write the HTTP request back to the SOCKS5 client
         let mut http_resp_vec = Vec::new();
         response.write_http(&mut http_resp_vec)?;
-        buffered_stream.write_all(&http_resp_vec).await?;
-        buffered_stream.flush().await?;
-        debug!(
+        stream.write_all(&http_resp_vec).await?;
+        stream.flush().await?;
+        info!(
             sent_len = http_resp_vec.len(),
-            "HTTP Response written to SOCKS stream"
+            "HTTP response written to SOCKS client stream."
         );
         Ok(())
     }
@@ -174,20 +299,20 @@ impl Handler for OHTTPSocksProxy {
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + Sync,
     {
-        trace!(?request, "Handling new SOCKS5 request");
+        trace!(?request, "Handling new SOCKS5 request.");
         match &request {
             Request::Connect(_proxy_protocol_target_addr) => {
-                debug!(?request, "SOCKS5 TCP Connect requested");
+                debug!(?request, "SOCKS5 TCP Connect requested.");
                 stream.write_response_unspecified().await?;
-                debug!("Unspecified response sent");
+                debug!("Unspecified response sent.");
                 self.perform_ohttp_transaction_on_stream(stream)
                     .await
-                    .inspect_err(|e| error!(?e, "Caught error in OHTTP transaction"))
+                    .inspect_err(|e| error!(?e, "Error in OHTTP transaction."))
                     .map_err(io::Error::other)?;
-                debug!(?request, "TCP Connect completed")
+                debug!(?request, "SOCKS5 TCP transaction completed.");
             }
             Request::Associate(_) | Request::Bind(_) => {
-                warn!(?request, "Unsupported SOCKS5 request");
+                warn!(?request, "Unsupported SOCKS5 request.");
                 stream.write_response_unsupported().await?;
             }
         }
@@ -197,22 +322,26 @@ impl Handler for OHTTPSocksProxy {
 }
 
 async fn start(args: Args) -> Result<(), OhttpProxyError> {
-    let mut ohttp_proxy = OHTTPSocksProxy::try_new(args.ohttp_url, "secret".to_string())?;
-    ohttp_proxy.get_configuration().await?;
+    let mut ohttp_proxy =
+        OHTTPSocksProxy::try_new(args.ohttp_relay_url, args.relay_headers, args.ca_cert)?;
+    ohttp_proxy
+        .get_configuration(args.ohttp_configuration_url)
+        .await?;
 
-    let listener = TcpListener::bind(args.listen).await.unwrap();
+    let listener = TcpListener::bind(args.listen).await?;
     info!(
-        "SOCKS server listening on {}",
-        listener.local_addr().unwrap()
+        listen_addr = ?listener.local_addr(),
+        "SOCKS server listening."
     );
 
     let config = Config::new(NoAuthentication, ohttp_proxy);
 
     Server::run(listener, config.into(), async {
-        tokio::signal::ctrl_c().await.unwrap();
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to listen for signal.")
     })
-    .await
-    .unwrap();
+    .await?;
     Ok(())
 }
 
@@ -222,7 +351,209 @@ async fn main() {
     let subscriber = FmtSubscriber::builder()
         .with_max_level(args.verbosity)
         .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("Setting default tracing subscriber failed.");
 
-    start(args).await.unwrap();
+    match start(args).await {
+        Ok(_) => info!("Exiting cleanly."),
+        Err(e) => error!(?e, "Exiting with an error."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mockito::Server;
+
+    /// Test successful OHTTP configuration retrieval
+    #[tokio::test]
+    async fn test_get_configuration_success() {
+        // Create a mock server
+        let mut server = Server::new_async().await;
+
+        // Mock OHTTP configuration data (minimal valid OHTTP config)
+        let mock_config = vec![0xDE, 0xAD, 0xCA, 0xFE]; // Not real
+
+        // Set up mock endpoint
+        let mock = server
+            .mock("GET", "/ohttp-configs")
+            .with_status(200)
+            .with_header("content-type", "application/octet-stream")
+            .with_header("content-length", &mock_config.len().to_string())
+            .with_body(&mock_config)
+            .create_async()
+            .await;
+
+        // Create proxy instance
+        let mut proxy = OHTTPSocksProxy::try_new(
+            server.url(),
+            None, // No relay headers
+            None, // No custom CA cert
+        )
+        .expect("Failed to create proxy");
+
+        // Test get_configuration
+        let result = proxy
+            .get_configuration(format!("{}/ohttp-configs", server.url()))
+            .await;
+
+        // Verify success
+        assert!(result.is_ok(), "get_configuration should succeed");
+
+        // Verify configuration was stored
+        let config_guard = proxy.ohttp_config.lock().unwrap();
+        assert!(config_guard.is_some(), "Configuration should be stored");
+        assert_eq!(
+            config_guard.as_ref().unwrap(),
+            &mock_config,
+            "Stored config should match mock data"
+        );
+
+        // Verify mock was called
+        mock.assert_async().await;
+    }
+
+    /// Test configuration retrieval with wrong content type
+    #[tokio::test]
+    async fn test_get_configuration_wrong_content_type() {
+        let mut server = Server::new_async().await;
+
+        let mock = server
+            .mock("GET", "/ohttp-configs")
+            .with_status(200)
+            .with_header("content-type", "text/plain") // Wrong content type
+            .with_header("content-length", "4")
+            .with_body("test")
+            .create_async()
+            .await;
+
+        let mut proxy =
+            OHTTPSocksProxy::try_new(server.url(), None, None).expect("Failed to create proxy");
+
+        let result = proxy
+            .get_configuration(format!("{}/ohttp-configs", server.url()))
+            .await;
+
+        // Should fail with content type mismatch
+        assert!(result.is_err(), "Should fail with wrong content type");
+        match result.unwrap_err() {
+            OhttpProxyError::ContentTypeMismatchError(expected, actual) => {
+                assert_eq!(expected, "application/octet-stream");
+                assert_eq!(actual, "text/plain");
+            }
+            _ => panic!("Expected ContentTypeMismatchError"),
+        }
+
+        mock.assert_async().await;
+    }
+
+    /// Test configuration retrieval with oversized response
+    #[tokio::test]
+    async fn test_get_configuration_too_large() {
+        let mut server = Server::new_async().await;
+
+        let large_size = MAX_OHTTP_CONFIG_SIZE + 1;
+        let large_body = vec![0u8; large_size as usize]; // Body matches content-length
+
+        let mock = server
+            .mock("GET", "/ohttp-configs")
+            .with_status(200)
+            .with_header("content-type", "application/octet-stream")
+            .with_header("content-length", &large_size.to_string())
+            .with_body(&large_body)
+            .create_async()
+            .await;
+
+        let mut proxy =
+            OHTTPSocksProxy::try_new(server.url(), None, None).expect("Failed to create proxy");
+
+        let result = proxy
+            .get_configuration(format!("{}/ohttp-configs", server.url()))
+            .await;
+
+        // Should fail with HttpTooLarge error
+        assert!(result.is_err(), "Should fail with oversized config");
+        match result.unwrap_err() {
+            OhttpProxyError::HttpTooLarge(size) => {
+                assert_eq!(size, MAX_OHTTP_CONFIG_SIZE + 1);
+            }
+            _ => panic!("Expected HttpTooLarge error"),
+        }
+
+        mock.assert_async().await;
+    }
+
+    /// Test configuration retrieval with custom relay headers
+    #[tokio::test]
+    async fn test_get_configuration_with_relay_headers() {
+        let mut server = Server::new_async().await;
+
+        let mock_config = vec![0x01, 0x00, 0x20, 0x00];
+
+        // Expect custom headers in the request
+        let mock = server
+            .mock("GET", "/ohttp-configs")
+            .match_header("X-Auth", "secret123")
+            .match_header("X-Client", "test-client")
+            .with_status(200)
+            .with_header("content-type", "application/octet-stream")
+            .with_header("content-length", &mock_config.len().to_string())
+            .with_body(&mock_config)
+            .create_async()
+            .await;
+
+        // Create proxy with relay headers
+        let relay_headers = vec![
+            "X-Auth=secret123".to_string(),
+            "X-Client=test-client".to_string(),
+        ];
+
+        let mut proxy = OHTTPSocksProxy::try_new(server.url(), Some(relay_headers), None)
+            .expect("Failed to create proxy");
+
+        let result = proxy
+            .get_configuration(format!("{}/ohttp-configs", server.url()))
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "get_configuration should succeed with relay headers"
+        );
+
+        // Verify configuration was stored
+        let config_guard = proxy.ohttp_config.lock().unwrap();
+        assert!(config_guard.is_some(), "Configuration should be stored");
+        assert_eq!(
+            config_guard.as_ref().unwrap(),
+            &mock_config,
+            "Stored config should match mock data"
+        );
+
+        mock.assert_async().await;
+    }
+
+    /// Test configuration retrieval with HTTP error status
+    #[tokio::test]
+    async fn test_get_configuration_http_error() {
+        let mut server = Server::new_async().await;
+
+        let mock = server
+            .mock("GET", "/ohttp-configs")
+            .with_status(418)
+            .with_body("I'm a teapot")
+            .create_async()
+            .await;
+
+        let mut proxy =
+            OHTTPSocksProxy::try_new(server.url(), None, None).expect("Failed to create proxy");
+
+        let result = proxy
+            .get_configuration(format!("{}/ohttp-configs", server.url()))
+            .await;
+
+        // Should fail with HTTP error
+        assert!(result.is_err(), "Should fail with 418 status");
+
+        mock.assert_async().await;
+    }
 }
