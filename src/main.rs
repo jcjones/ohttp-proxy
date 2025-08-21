@@ -27,12 +27,12 @@ struct Args {
     #[command(flatten)]
     verbosity: Verbosity<InfoLevel>,
 
-    /// The socket address on which to listen.
+    /// The socket address on which to listen for SOCKS5 connections.
     ///
     /// 0.0.0.0 or [::] are v4 and v6 wildcard addresses.
     /// For IPv4 localhost only, use 127.0.0.1:<port>
     #[arg(long, default_value = "[::]:32547")]
-    listen: SocketAddr,
+    socks5: SocketAddr,
 
     /// URL to the OHTTP Relay's gateway, often ending in `/gateway`
     ///
@@ -328,15 +328,15 @@ async fn start(args: Args) -> Result<(), OhttpProxyError> {
         .get_configuration(args.ohttp_configuration_url)
         .await?;
 
-    let listener = TcpListener::bind(args.listen).await?;
+    let socks5_listener = TcpListener::bind(args.socks5).await?;
     info!(
-        listen_addr = ?listener.local_addr(),
+        listen_addr = ?socks5_listener.local_addr(),
         "SOCKS server listening."
     );
 
     let config = Config::new(NoAuthentication, ohttp_proxy);
 
-    Server::run(listener, config.into(), async {
+    Server::run(socks5_listener, config.into(), async {
         tokio::signal::ctrl_c()
             .await
             .expect("Failed to listen for signal.")

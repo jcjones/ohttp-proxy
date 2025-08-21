@@ -1,4 +1,4 @@
-# OHTTP SOCKS5 Proxy
+# OHTTP Proxy
 
 A SOCKS5 proxy (RFC 1928) that routes traffic through Oblivious HTTP (RFC 9458) using Binary HTTP messages (RFC 9292).
 
@@ -10,11 +10,13 @@ This proxy accepts standard SOCKS5 TCP connections and forwards HTTP requests th
 
 Technically, this project can send directly to an OHTTP gateway, though that compromises the point of OHTTP.
 
-NOTE: This project does not seek to implement a complete SOCKS5 proxy. UDP is not supported. Additionally, DNS in the SOCKS protocol is ignored and left to the Gateway to perform.
+> [!NOTE]
+> This project does not seek to implement a complete SOCKS5 proxy. Neither `UDP Associate` nor `BIND` are supported. Additionally, DNS in the SOCKS protocol is ignored and left to the Gateway to perform.
 
 ## Missing Features
 - **Full IPv6 support**: It somewhat works, but it needs more baking and tests.
 - **HTTP/2**: SOCKS5 doesn't support HTTP/2, so it'll always downgrade. Guess that needs a normal HTTP proxy, eh?
+- **HTTP Proxy support**: SOCKS5 was simpler to get started with, but support for standard RFC 9110 HTTP proxies is desireable, to support HTTP/2.
 
 ## Installation
 
@@ -27,7 +29,7 @@ cargo build --release
 ### Basic Usage
 
 ```bash
-./target/release/ohttp-socks5-proxy \
+./target/release/ohttp-proxy \
   --ohttp-relay-url https://relay.example.com \
   --ohttp-configuration-url https://relay.example.com/ohttp-configs
 ```
@@ -35,8 +37,8 @@ cargo build --release
 ### Advanced Usage with Authentication
 
 ```bash
-./target/release/ohttp-socks5-proxy \
-  --listen 127.0.0.1:8080 \
+./target/release/ohttp-proxy \
+  --socks5 127.0.0.1:8080 \
   --ohttp-relay-url https://relay.example.com/gateway \
   --ohttp-configuration-url https://relay.example.com/ohttp-configs \
   --relay-headers "X-Auth-Token=your-secret-token" \
@@ -47,7 +49,7 @@ cargo build --release
 
 ### Command Line Options
 
-- `--listen <ADDRESS>`: Socket address to listen on (default: `[::]:32547`)
+- `--socks5 <ADDRESS>`: Socket address to listen for SOCKS5 requests on (default: `[::]:32547`)
 
 - `--ohttp-relay-url <URL>`: URL of the OHTTP relay server (required)
 

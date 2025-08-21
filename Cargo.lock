@@ -1277,7 +1277,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ohttp-socks5-proxy"
+name = "ohttp-proxy"
 version = "0.1.0"
 dependencies = [
  "bhttp",

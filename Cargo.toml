@@ -1,6 +1,6 @@
 [package]
-name = "ohttp-socks5-proxy"
-description = "SOCKS5 Proxy for Oblivious HTTP (RFC 9458) using Binary HTTP messages (RFC 9292)"
+name = "ohttp-proxy"
+description = "Proxy for Oblivious HTTP (RFC 9458) using Binary HTTP messages (RFC 9292), supporting SOCKS5 (RFC 1928)"
 version = "0.1.0"
 edition = "2024"
 license = "MPL-2.0"
