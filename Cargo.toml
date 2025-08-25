@@ -22,3 +22,12 @@ tracing-subscriber = "0.3.19"
 [dev-dependencies]
 mockito = "1.5.0"
 tokio-test = "0.4.4"
+
+[lints.clippy]
+unreadable_literal = "deny"
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_op_in_unsafe_fn = "deny"

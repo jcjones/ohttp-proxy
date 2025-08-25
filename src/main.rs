@@ -1,3 +1,9 @@
+//! OHTTP Proxy Server
+//!
+//! A SOCKS5 proxy server that routes traffic through OHTTP (Oblivious HTTP) relays
+//! for enhanced privacy and anonymity. This proxy accepts SOCKS5 connections and
+//! forwards them through encrypted OHTTP tunnels to protect client metadata.
+
 use bhttp::{Message, Mode};
 use bytes::BytesMut;
 use clap::Parser;
@@ -59,32 +65,49 @@ struct Args {
     relay_headers: Option<Vec<String>>,
 }
 
+/// Errors that can occur during OHTTP proxy operations.
+///
+/// This enum captures all possible failure modes when processing SOCKS5 requests
+/// through OHTTP relays, including transport errors, encoding issues, and protocol violations.
 #[derive(Error, Debug)]
 pub enum OhttpProxyError {
+    /// OHTTP protocol error occurred during request/response processing
     #[error("Error in OHTTP")]
     OhttpError(#[from] ohttp::Error),
+    /// Binary HTTP (BHTTP) encoding/decoding error
     #[error("Error in BHTTP")]
     BhttpError(#[from] bhttp::Error),
+    /// HTTP client error when communicating with relay servers
     #[error("Error in HTTP transport")]
     ReqwestError(#[from] reqwest::Error),
+    /// HTTP header contains invalid value that cannot be encoded
     #[error("Invalid header value")]
     HeaderValueError(#[from] InvalidHeaderValue),
+    /// HTTP header name is invalid according to HTTP specifications
     #[error("Invalid header name")]
     HeaderNameError(#[from] reqwest::header::InvalidHeaderName),
+    /// String data could not be converted to proper encoding
     #[error("Invalid String Encoding")]
     StringEncodingError(#[from] ToStrError),
+    /// Data is not valid UTF-8 when UTF-8 encoding was expected
     #[error("Invalid UTF-8 Encoding")]
     UTF8EncodingError(#[from] FromUtf8Error),
+    /// OHTTP configuration has not been fetched or is invalid
     #[error("OHTTP is unconfigured")]
     Unconfigured,
+    /// HTTP response Content-Type header does not match expected value
     #[error("Invalid Content Type: {0} != {1}")]
     ContentTypeMismatchError(String, String),
+    /// HTTP data exceeds configured size limits
     #[error("Unexpectedly large HTTP data: {0}")]
     HttpTooLarge(u64),
+    /// HTTP response contained no data when data was expected
     #[error("HTTP response data is empty")]
     ResponseEmpty,
+    /// Input/output operation failed (file system, network, etc.)
     #[error("IO Error")]
     IOError(#[from] std::io::Error),
+    /// Mutex was poisoned due to panic in another thread
     #[error("Mutex poisoned")]
     MutexPoisoned,
 }
@@ -96,6 +119,11 @@ const MAX_OHTTP_CONFIG_SIZE: u64 = 64 * 1024; // 64 kB
 const MAX_OHTTP_RESPONSE_SIZE: u64 = 1024 * 1024; // 1MB
 const SOCKS5_REQ_BUF_SIZE: usize = 64 * 1024; // 64kB
 
+/// OHTTP SOCKS5 Proxy server implementation.
+///
+/// This struct manages the lifecycle of a SOCKS5 proxy server that routes traffic
+/// through OHTTP relays. It handles OHTTP configuration fetching, request encryption,
+/// and response decryption while maintaining SOCKS5 protocol compatibility.
 pub struct OHTTPSocksProxy {
     ohttp_relay_client: Client,
     gateway_url: String,
