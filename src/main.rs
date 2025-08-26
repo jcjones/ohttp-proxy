@@ -190,7 +190,7 @@ impl OHTTPSocksProxy {
             }
         }
         let ohttp_vec = resp.bytes().await?.to_vec();
-        info!(config_url, ohttp_config_len=?ohttp_vec.len(), "Obtained OHTTP configuration from relay.");
+        info!(config_url, ohttp_config_len=?ohttp_vec.len(), "Obtained OHTTP configuration.");
 
         *self
             .ohttp_config
