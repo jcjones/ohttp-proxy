@@ -429,13 +429,15 @@ mod tests {
         assert!(result.is_ok(), "get_configuration should succeed");
 
         // Verify configuration was stored
-        let config_guard = proxy.ohttp_config.lock().unwrap();
-        assert!(config_guard.is_some(), "Configuration should be stored");
-        assert_eq!(
-            config_guard.as_ref().unwrap(),
-            &mock_config,
-            "Stored config should match mock data"
-        );
+        {
+            let config_guard = proxy.ohttp_config.lock().unwrap();
+            assert!(config_guard.is_some(), "Configuration should be stored");
+            assert_eq!(
+                config_guard.as_ref().unwrap(),
+                &mock_config,
+                "Stored config should match mock data"
+            );
+        }
 
         // Verify mock was called
         mock.assert_async().await;
@@ -549,13 +551,15 @@ mod tests {
         );
 
         // Verify configuration was stored
-        let config_guard = proxy.ohttp_config.lock().unwrap();
-        assert!(config_guard.is_some(), "Configuration should be stored");
-        assert_eq!(
-            config_guard.as_ref().unwrap(),
-            &mock_config,
-            "Stored config should match mock data"
-        );
+        {
+            let config_guard = proxy.ohttp_config.lock().unwrap();
+            assert!(config_guard.is_some(), "Configuration should be stored");
+            assert_eq!(
+                config_guard.as_ref().unwrap(),
+                &mock_config,
+                "Stored config should match mock data"
+            );
+        }
 
         mock.assert_async().await;
     }
