@@ -175,19 +175,19 @@ impl OHTTPSocksProxy {
             .send()
             .await?
             .error_for_status()?;
-        if let Some(value) = resp.headers().get(CONTENT_TYPE) {
-            if value != OHTTP_CONFIG_TYPE {
-                let s = value.to_str()?;
-                return Err(OhttpProxyError::ContentTypeMismatchError(
-                    OHTTP_CONFIG_TYPE.to_string(),
-                    s.to_string(),
-                ));
-            }
+        if let Some(value) = resp.headers().get(CONTENT_TYPE)
+            && value != OHTTP_CONFIG_TYPE
+        {
+            let s = value.to_str()?;
+            return Err(OhttpProxyError::ContentTypeMismatchError(
+                OHTTP_CONFIG_TYPE.to_string(),
+                s.to_string(),
+            ));
         }
-        if let Some(size) = resp.content_length() {
-            if size > MAX_OHTTP_CONFIG_SIZE {
-                return Err(OhttpProxyError::HttpTooLarge(size));
-            }
+        if let Some(size) = resp.content_length()
+            && size > MAX_OHTTP_CONFIG_SIZE
+        {
+            return Err(OhttpProxyError::HttpTooLarge(size));
         }
         let ohttp_vec = resp.bytes().await?.to_vec();
         info!(config_url, ohttp_config_len=?ohttp_vec.len(), "Obtained OHTTP configuration.");
@@ -233,10 +233,10 @@ impl OHTTPSocksProxy {
                 "<empty>".to_string(),
             ));
         }
-        if let Some(size) = resp.content_length() {
-            if size > MAX_OHTTP_RESPONSE_SIZE {
-                return Err(OhttpProxyError::HttpTooLarge(size));
-            }
+        if let Some(size) = resp.content_length()
+            && size > MAX_OHTTP_RESPONSE_SIZE
+        {
+            return Err(OhttpProxyError::HttpTooLarge(size));
         }
         trace!(
             status = resp.status().as_u16(),
@@ -429,13 +429,15 @@ mod tests {
         assert!(result.is_ok(), "get_configuration should succeed");
 
         // Verify configuration was stored
-        let config_guard = proxy.ohttp_config.lock().unwrap();
-        assert!(config_guard.is_some(), "Configuration should be stored");
-        assert_eq!(
-            config_guard.as_ref().unwrap(),
-            &mock_config,
-            "Stored config should match mock data"
-        );
+        {
+            let config_guard = proxy.ohttp_config.lock().unwrap();
+            assert!(config_guard.is_some(), "Configuration should be stored");
+            assert_eq!(
+                config_guard.as_ref().unwrap(),
+                &mock_config,
+                "Stored config should match mock data"
+            );
+        }
 
         // Verify mock was called
         mock.assert_async().await;
@@ -549,13 +551,15 @@ mod tests {
         );
 
         // Verify configuration was stored
-        let config_guard = proxy.ohttp_config.lock().unwrap();
-        assert!(config_guard.is_some(), "Configuration should be stored");
-        assert_eq!(
-            config_guard.as_ref().unwrap(),
-            &mock_config,
-            "Stored config should match mock data"
-        );
+        {
+            let config_guard = proxy.ohttp_config.lock().unwrap();
+            assert!(config_guard.is_some(), "Configuration should be stored");
+            assert_eq!(
+                config_guard.as_ref().unwrap(),
+                &mock_config,
+                "Stored config should match mock data"
+            );
+        }
 
         mock.assert_async().await;
     }
