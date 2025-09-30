@@ -30,7 +30,7 @@ jobs:
         # must be bumped by hand, since the pre-release component of a version
         # number is unstructured.
         run: |
-          for CRATE in relay control; do \
+          for CRATE in ohttp-proxy; do \
             cargo metadata --no-deps --format-version 1 | \
               jq --arg CRATE "${CRATE}" -r '.packages | .[] | select(.name == $CRATE) | .version' | \
               grep '^\(0\|[1-9][0-9]*\)\.\(0\|[1-9][0-9]*\)\.\(0\|[1-9][0-9]*\)$'; \
@@ -54,7 +54,7 @@ jobs:
             cargo-edit
 
       - run: |
-          for CRATE in relay control; do \
+          for CRATE in ohttp-proxy; do \
             cargo set-version --package ${CRATE} --bump patch; \
           done
       - run: git diff
@@ -64,7 +64,7 @@ jobs:
         run: |
           git config user.email "github-automation@insufficient.coffee"
           git config user.name "github-automation"
-          git commit -am "Bump relay patch versions, triggered by @$ACTOR"
+          git commit -am "Bump patch versions, triggered by @$ACTOR"
           git push
 
   # This job is kept separate from the previous one to enable retrying it without
