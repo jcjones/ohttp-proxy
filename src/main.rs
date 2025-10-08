@@ -21,7 +21,7 @@ use socks_lib::{
         server::{Config, Handler, Server, auth::NoAuthentication},
     },
 };
-use std::{io::Cursor, net::SocketAddr, string::FromUtf8Error, sync::Mutex};
+use std::{io::Cursor, net::SocketAddr, str::FromStr, string::FromUtf8Error, sync::Mutex};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, info, instrument, trace, warn};
@@ -63,6 +63,15 @@ struct Args {
     /// May be specified multiple times, to send more than one header.
     #[arg(long)]
     relay_headers: Option<Vec<String>>,
+
+    /// If specified, these HTTP headers will be forwarded to
+    /// the relay.
+    ///
+    /// Example: Authentication
+    ///
+    /// May be specified multiple times, to send more than one header.
+    #[arg(long)]
+    passthrough_headers: Option<Vec<String>>,
 }
 
 /// Errors that can occur during OHTTP proxy operations.
@@ -128,12 +137,14 @@ pub struct OHTTPSocksProxy {
     ohttp_relay_client: Client,
     gateway_url: String,
     ohttp_config: Mutex<Option<Vec<u8>>>,
+    passthrough_headers: Option<Vec<String>>,
 }
 
 impl OHTTPSocksProxy {
     fn try_new(
         gateway_url: String,
         relay_headers: Option<Vec<String>>,
+        passthrough_headers: Option<Vec<String>>,
         ca_cert_path: Option<String>,
     ) -> Result<Self, OhttpProxyError> {
         let mut headers = HeaderMap::new();
@@ -164,6 +175,7 @@ impl OHTTPSocksProxy {
             gateway_url,
             ohttp_relay_client: client_builder.build()?,
             ohttp_config: Mutex::new(None),
+            passthrough_headers,
         })
     }
 
@@ -210,11 +222,12 @@ impl OHTTPSocksProxy {
     }
 
     #[instrument(skip(self, req_body))]
-    async fn ohttp_tx(&self, req_body: Vec<u8>) -> Result<Vec<u8>, OhttpProxyError> {
+    async fn ohttp_tx(&self, req_body: Vec<u8>, req_headers: HeaderMap) -> Result<Vec<u8>, OhttpProxyError> {
         let resp = self
             .ohttp_relay_client
             .post(&self.gateway_url)
             .header(CONTENT_TYPE, OHTTP_REQ_TYPE)
+            .headers(req_headers)
             .body(req_body)
             .send()
             .await?
@@ -276,6 +289,16 @@ impl OHTTPSocksProxy {
             "HTTP request read from SOCKS5 client, forwarding using OHTTP."
         );
 
+        let mut req_headers = HeaderMap::new();
+        // Copy any passthrough headers provided
+        if let Some(passthrough_headers) = &self.passthrough_headers {
+            for header in passthrough_headers {
+                if let Some(value) = req_msg.header().get(header.as_bytes()) {
+                    req_headers.append(HeaderName::from_str(header)?, HeaderValue::from_bytes(value)?);
+                }
+            }
+        }
+
         // Convert the request to Binary HTTP format
         let mut req_bhttp_vec = Vec::new();
         req_msg.write_bhttp(Mode::KnownLength, &mut req_bhttp_vec)?;
@@ -289,7 +312,7 @@ impl OHTTPSocksProxy {
         );
 
         // Send OHTTP request, get back OHTTP response
-        let ohttp_response_vec = self.ohttp_tx(enc_request_vec).await?;
+        let ohttp_response_vec = self.ohttp_tx(enc_request_vec, req_headers).await?;
         debug!(
             encap_rsp_len = ohttp_response_vec.len(),
             "Received encapsulated OHTTP response from Gateway, via Relay."
@@ -351,7 +374,7 @@ impl Handler for OHTTPSocksProxy {
 
 async fn start(args: Args) -> Result<(), OhttpProxyError> {
     let mut ohttp_proxy =
-        OHTTPSocksProxy::try_new(args.ohttp_relay_url, args.relay_headers, args.ca_cert)?;
+        OHTTPSocksProxy::try_new(args.ohttp_relay_url, args.relay_headers, args.passthrough_headers, args.ca_cert)?;
     ohttp_proxy
         .get_configuration(args.ohttp_configuration_url)
         .await?;
@@ -416,6 +439,7 @@ mod tests {
         let mut proxy = OHTTPSocksProxy::try_new(
             server.url(),
             None, // No relay headers
+            None, // No passthrough headers
             None, // No custom CA cert
         )
         .expect("Failed to create proxy");
@@ -458,7 +482,7 @@ mod tests {
             .await;
 
         let mut proxy =
-            OHTTPSocksProxy::try_new(server.url(), None, None).expect("Failed to create proxy");
+            OHTTPSocksProxy::try_new(server.url(), None, None, None).expect("Failed to create proxy");
 
         let result = proxy
             .get_configuration(format!("{}/ohttp-configs", server.url()))
@@ -495,7 +519,7 @@ mod tests {
             .await;
 
         let mut proxy =
-            OHTTPSocksProxy::try_new(server.url(), None, None).expect("Failed to create proxy");
+            OHTTPSocksProxy::try_new(server.url(), None, None, None).expect("Failed to create proxy");
 
         let result = proxy
             .get_configuration(format!("{}/ohttp-configs", server.url()))
@@ -538,7 +562,7 @@ mod tests {
             "X-Client=test-client".to_string(),
         ];
 
-        let mut proxy = OHTTPSocksProxy::try_new(server.url(), Some(relay_headers), None)
+        let mut proxy = OHTTPSocksProxy::try_new(server.url(), Some(relay_headers), None, None)
             .expect("Failed to create proxy");
 
         let result = proxy
@@ -577,7 +601,7 @@ mod tests {
             .await;
 
         let mut proxy =
-            OHTTPSocksProxy::try_new(server.url(), None, None).expect("Failed to create proxy");
+            OHTTPSocksProxy::try_new(server.url(), None, None, None).expect("Failed to create proxy");
 
         let result = proxy
             .get_configuration(format!("{}/ohttp-configs", server.url()))
