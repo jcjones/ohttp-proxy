@@ -293,9 +293,11 @@ impl OHTTPSocksProxy {
         // Copy any passthrough headers provided
         if let Some(passthrough_headers) = &self.passthrough_headers {
             for header in passthrough_headers {
-                if let Some(value) = req_msg.header().get(header.as_bytes()) {
+                if let Some(value) = req_msg.header().get(header.to_ascii_lowercase().as_bytes()) {
+                    trace!(header, value, "Appending passthrough header");
                     req_headers.append(HeaderName::from_str(header)?, HeaderValue::from_bytes(value)?);
                 }
+                // TODO: Find a way to remove the header from req_msg.header()
             }
         }
 
