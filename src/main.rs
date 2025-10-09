@@ -222,7 +222,11 @@ impl OHTTPSocksProxy {
     }
 
     #[instrument(skip(self, req_body))]
-    async fn ohttp_tx(&self, req_body: Vec<u8>, req_headers: HeaderMap) -> Result<Vec<u8>, OhttpProxyError> {
+    async fn ohttp_tx(
+        &self,
+        req_body: Vec<u8>,
+        req_headers: HeaderMap,
+    ) -> Result<Vec<u8>, OhttpProxyError> {
         let resp = self
             .ohttp_relay_client
             .post(&self.gateway_url)
@@ -295,7 +299,10 @@ impl OHTTPSocksProxy {
             for header in passthrough_headers {
                 if let Some(value) = req_msg.header().get(header.to_ascii_lowercase().as_bytes()) {
                     trace!(header, value, "Appending passthrough header");
-                    req_headers.append(HeaderName::from_str(header)?, HeaderValue::from_bytes(value)?);
+                    req_headers.append(
+                        HeaderName::from_str(header)?,
+                        HeaderValue::from_bytes(value)?,
+                    );
                 }
                 // TODO: Find a way to remove the header from req_msg.header()
             }
@@ -375,8 +382,12 @@ impl Handler for OHTTPSocksProxy {
 }
 
 async fn start(args: Args) -> Result<(), OhttpProxyError> {
-    let mut ohttp_proxy =
-        OHTTPSocksProxy::try_new(args.ohttp_relay_url, args.relay_headers, args.passthrough_headers, args.ca_cert)?;
+    let mut ohttp_proxy = OHTTPSocksProxy::try_new(
+        args.ohttp_relay_url,
+        args.relay_headers,
+        args.passthrough_headers,
+        args.ca_cert,
+    )?;
     ohttp_proxy
         .get_configuration(args.ohttp_configuration_url)
         .await?;
@@ -483,8 +494,8 @@ mod tests {
             .create_async()
             .await;
 
-        let mut proxy =
-            OHTTPSocksProxy::try_new(server.url(), None, None, None).expect("Failed to create proxy");
+        let mut proxy = OHTTPSocksProxy::try_new(server.url(), None, None, None)
+            .expect("Failed to create proxy");
 
         let result = proxy
             .get_configuration(format!("{}/ohttp-configs", server.url()))
@@ -520,8 +531,8 @@ mod tests {
             .create_async()
             .await;
 
-        let mut proxy =
-            OHTTPSocksProxy::try_new(server.url(), None, None, None).expect("Failed to create proxy");
+        let mut proxy = OHTTPSocksProxy::try_new(server.url(), None, None, None)
+            .expect("Failed to create proxy");
 
         let result = proxy
             .get_configuration(format!("{}/ohttp-configs", server.url()))
@@ -602,8 +613,8 @@ mod tests {
             .create_async()
             .await;
 
-        let mut proxy =
-            OHTTPSocksProxy::try_new(server.url(), None, None, None).expect("Failed to create proxy");
+        let mut proxy = OHTTPSocksProxy::try_new(server.url(), None, None, None)
+            .expect("Failed to create proxy");
 
         let result = proxy
             .get_configuration(format!("{}/ohttp-configs", server.url()))
